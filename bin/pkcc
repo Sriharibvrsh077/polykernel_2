@@ -1,0 +1,586 @@
+#!/bin/sh
+# Runs with $PK_PYTHON if set, else python3.14 when installed, else python3.
+"exec" "${PK_PYTHON:-$(command -v python3.14 || command -v python3)}" "$0" "$@"
+HELP = """pkcc - an nvcc-compatible compiler driver for PolyKernel.
+
+Compiles CUDA sources (.cu) for any CPU architecture that has a C++17 compiler,
+compiles the kernels to PTX (run on NVIDIA GPUs through the driver, no CUDA
+toolkit needed), and embeds an OpenCL C translation so the same binary can run
+them on AMD / Intel / ARM / Qualcomm / Apple GPUs through OpenCL.
+
+  pkcc -o app app.cu                         # native build
+  pkcc -arch=sm_75 -o app app.cu                  # PTX target for NVIDIA GPUs (default sm_60)
+  pkcc --target=aarch64-linux-gnu -o app app.cu   # cross build (ARM64)
+  pkcc -c a.cu -o a.o && pkcc a.o b.o -o app       # separate compilation
+
+Environment at run time: PK_BACKEND=auto|cpu|ptx|opencl, PK_VERBOSE=1,
+PK_NUM_THREADS=N, PK_CUDA_DEVICE=i, PK_OPENCL_DEVICE=i, PK_FORCE_FIBERS=1.
+"""
+
+import hashlib
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+
+if sys.version_info < (3, 8):
+    sys.exit('pkcc: error: Python 3.8 or newer is required (tested up to 3.14)')
+
+PK_HOME = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, os.path.join(PK_HOME, 'tools'))
+from pk_host import translate_host, TranslateError  # noqa: E402
+from pk_ocl import generate, SYNC_IDS  # noqa: E402
+from pk_lex import tokenize  # noqa: E402
+
+VERSION = '0.3.0'
+CU_EXT = ('.cu',)
+CXX_EXT = ('.cpp', '.cc', '.cxx', '.c++', '.C', '.cp')
+C_EXT = ('.c',)
+OBJ_EXT = ('.o', '.obj', '.a', '.so', '.lib', '.dylib')
+
+# nvcc options that take a separate argument and are ignored here
+IGNORED_WITH_ARG = {'-arch', '--gpu-architecture', '-code', '--gpu-code', '-gencode', '--generate-code',
+                    '-Xptxas', '--ptxas-options', '-Xnvlink', '--nvlink-options', '-maxrregcount',
+                    '--maxrregcount', '-t', '--threads', '-rdc', '--relocatable-device-code', '-Xarchive',
+                    '--archive-options', '-Xfatbin', '-ewp', '-split-compile', '--split-compile',
+                    '-default-stream', '--default-stream', '-res-usage', '-diag-suppress', '--diag-suppress',
+                    '-Xcudafe', '--cudafe-options', '-cudart', '--cudart', '-cudadevrt', '--cudadevrt',
+                    '-ftz', '-prec-div', '-prec-sqrt', '-fmad', '--ftz', '--prec-div', '--prec-sqrt', '--fmad'}
+IGNORED_FLAGS = {'-G', '--device-debug', '-lineinfo', '--generate-line-info', '--expt-relaxed-constexpr',
+                 '--expt-extended-lambda', '--extended-lambda', '-extended-lambda', '-use_fast_math',
+                 '--use_fast_math', '-Wno-deprecated-gpu-targets', '-dlink', '--device-link', '-dw',
+                 '-restrict', '--restrict', '-src-in-ptx', '--keep-device-functions', '-m64', '--machine=64',
+                 '-forward-unknown-to-host-compiler', '--forward-unknown-to-host-compiler', '-dopt',
+                 '-Werror=all-warnings', '-err-no', '--display-error-number', '-noprof'}
+
+COMMON_HEADERS = '''algorithm any array atomic bitset cassert ccomplex cctype cerrno cfenv cfloat charconv chrono
+cinttypes ciso646 climits clocale cmath codecvt complex condition_variable csetjmp csignal cstdarg cstdbool
+cstddef cstdint cstdio cstdlib cstring ctgmath ctime cuchar cwchar cwctype deque exception execution filesystem
+forward_list fstream functional future initializer_list iomanip ios iosfwd iostream istream iterator limits list
+locale map memory memory_resource mutex new numeric optional ostream queue random ratio regex scoped_allocator
+set shared_mutex sstream stack stdexcept streambuf string string_view system_error thread tuple type_traits
+typeindex typeinfo unordered_map unordered_set utility valarray variant vector version bit numbers span ranges
+concepts compare coroutine source_location format barrier latch semaphore stop_token
+assert.h complex.h ctype.h errno.h fenv.h float.h inttypes.h iso646.h limits.h locale.h math.h setjmp.h
+signal.h stdalign.h stdarg.h stdatomic.h stdbool.h stddef.h stdint.h stdio.h stdlib.h stdnoreturn.h string.h
+tgmath.h threads.h time.h uchar.h wchar.h wctype.h unistd.h strings.h pthread.h dirent.h fcntl.h getopt.h
+malloc.h memory.h sys/time.h sys/types.h sys/stat.h sys/mman.h sys/resource.h sys/sysinfo.h sys/times.h
+sys/wait.h sys/ioctl.h sys/socket.h dlfcn.h omp.h windows.h direct.h io.h process.h conio.h x86intrin.h
+immintrin.h emmintrin.h xmmintrin.h arm_neon.h'''.split()
+
+
+def read_text(path):
+    with open(path, encoding='utf-8', errors='replace') as f:
+        return f.read()
+
+
+def die(msg, code=1):
+    sys.stderr.write('pkcc: error: %s\n' % msg)
+    sys.exit(code)
+
+
+class Opts:
+    def __init__(self):
+        self.out = None
+        self.compile_only = False
+        self.preprocess_only = False
+        self.inputs = []
+        self.pp_flags = []      # -I -D -U -isystem -include
+        self.lib_flags = []     # -L -l
+        self.host_flags = []    # flags for the host compiler (compile)
+        self.link_flags = []
+        self.dep_flags = []
+        self.opt = None
+        self.std = None
+        self.xlang = None
+        self.ccbin = None
+        self.target = None
+        self.backend = 'all'
+        self.cuda_arch = '800'    # __CUDA_ARCH__ while compiling kernels (CPU code is device code here)
+        self.ptx_arch = None      # sm_XX for the PTX back end (None: sm_60, runs on Pascal and newer)
+        self.ptx = True
+        self.verbose = False
+        self.keep = False
+        self.shared = False
+
+
+def parse_args(argv):
+    o = Opts()
+    i = 0
+
+    def nxt():
+        nonlocal i
+        i += 1
+        if i >= len(argv):
+            die('missing argument after %s' % argv[i - 1])
+        return argv[i]
+
+    while i < len(argv):
+        a = argv[i]
+        if a in ('-o', '--output-file'):
+            o.out = nxt()
+        elif a in ('-c', '--compile', '-dc', '--device-c'):
+            o.compile_only = True
+        elif a in ('-E', '--preprocess'):
+            o.preprocess_only = True
+        elif a in ('-I', '--include-path', '-isystem', '-iquote', '-include', '--pre-include', '-idirafter'):
+            flag = {'--include-path': '-I', '--pre-include': '-include'}.get(a, a)
+            o.pp_flags += [flag, nxt()]
+        elif a.startswith('-I') or a.startswith('--include-path='):
+            o.pp_flags.append('-I' + a.split('=', 1)[1] if a.startswith('--') else a)
+        elif a in ('-D', '--define-macro', '-U', '--undefine-macro'):
+            flag = '-D' if a in ('-D', '--define-macro') else '-U'
+            o.pp_flags.append(flag + nxt())
+        elif a.startswith('-D') or a.startswith('-U'):
+            o.pp_flags.append(a)
+        elif a.startswith('--define-macro='):
+            o.pp_flags.append('-D' + a.split('=', 1)[1])
+        elif a in ('-L', '--library-path'):
+            o.lib_flags.append('-L' + nxt())
+        elif a.startswith('-L') or a.startswith('--library-path='):
+            o.lib_flags.append('-L' + a.split('=', 1)[1] if a.startswith('--') else a)
+        elif a in ('-l', '--library'):
+            o.lib_flags.append('-l' + nxt())
+        elif a.startswith('-l') or a.startswith('--library='):
+            o.lib_flags.append('-l' + a.split('=', 1)[1] if a.startswith('--') else a)
+        elif re.match(r'^-O[0-3sgz]?$|^-Ofast$', a):
+            o.opt = a if a != '-O' else '-O1'
+        elif a in ('-O', '--optimize'):
+            o.opt = '-O' + nxt()
+        elif a.startswith('--optimize='):
+            o.opt = '-O' + a.split('=', 1)[1]
+        elif a in ('-g', '--debug', '-ggdb'):
+            o.host_flags.append('-g')
+        elif a.startswith('-std='):
+            o.std = a.split('=', 1)[1]
+        elif a in ('-std', '--std'):
+            o.std = nxt()
+        elif a.startswith('--std='):
+            o.std = a.split('=', 1)[1]
+        elif a in ('-x', '--x'):
+            o.xlang = nxt()
+        elif a in ('-Xcompiler', '--compiler-options'):
+            o.host_flags += split_list(nxt())
+        elif a.startswith('-Xcompiler=') or a.startswith('--compiler-options='):
+            o.host_flags += split_list(a.split('=', 1)[1])
+        elif a in ('-Xlinker', '--linker-options'):
+            o.link_flags += ['-Wl,' + x for x in split_list(nxt())]
+        elif a.startswith('-Xlinker=') or a.startswith('--linker-options='):
+            o.link_flags += ['-Wl,' + x for x in split_list(a.split('=', 1)[1])]
+        elif a in ('-ccbin', '--compiler-bindir'):
+            o.ccbin = nxt()
+        elif a.startswith('-ccbin=') or a.startswith('--compiler-bindir='):
+            o.ccbin = a.split('=', 1)[1]
+        elif a.startswith('--target=') or a.startswith('--pk-target='):
+            o.target = a.split('=', 1)[1]
+        elif a in ('--target', '--pk-target'):
+            o.target = nxt()
+        elif a.startswith('--pk-backend='):
+            o.backend = a.split('=', 1)[1]
+            if o.backend not in ('all', 'cpu'):
+                die('--pk-backend must be "all" or "cpu"')
+        elif a in ('-v', '--verbose', '--pk-verbose'):
+            o.verbose = True
+        elif a in ('--keep', '-keep'):
+            o.keep = True
+        elif a in ('--version', '-V'):
+            print('pkcc (PolyKernel) %s - clean-room CUDA compatibility for any CPU, NVIDIA GPUs (own PTX compiler) and OpenCL GPUs' % VERSION)
+            print('running on Python %s (%s)' % (sys.version.split()[0], sys.executable))
+            sys.exit(0)
+        elif a in ('-h', '--help'):
+            print(HELP)
+            sys.exit(0)
+        elif a in ('-shared', '--shared'):
+            o.shared = True
+            o.link_flags.append('-shared')
+        elif a.startswith(('-arch=', '--gpu-architecture=', '-gencode=', '--generate-code=')) or \
+                (a.startswith('-arch') and a[5:].startswith(('sm', 'compute'))):
+            set_arch(o, a.split('=', 1)[1] if '=' in a else a[5:])
+        elif a in IGNORED_FLAGS or a.startswith('-arch=') or a.startswith('-arch') and len(a) > 5 and a[5] != '=' \
+                and a[5:].startswith('sm') or a.startswith('--gpu-architecture=') or a.startswith('-code=') \
+                or a.startswith('-gencode=') or a.startswith('--generate-code=') or a.startswith('-maxrregcount=') \
+                or a.startswith('-rdc=') or a.startswith('--relocatable-device-code=') or a.startswith('-Xptxas=') \
+                or a.startswith('--ptxas-options=') or a.startswith('-diag-suppress=') or a.startswith('--threads=') \
+                or a.startswith('-ftz=') or a.startswith('-prec-') or a.startswith('-fmad=') or a.startswith('--ftz=') \
+                or a.startswith('--prec-') or a.startswith('--fmad=') or a.startswith('-default-stream=') \
+                or a.startswith('--default-stream=') or a.startswith('-cudart=') or a.startswith('--cudart='):
+            pass
+        elif a.startswith('--pk-cuda-arch='):
+            o.cuda_arch = a.split('=', 1)[1]
+        elif a in ('-arch', '--gpu-architecture', '-gencode', '--generate-code'):
+            set_arch(o, nxt())
+        elif a in IGNORED_WITH_ARG:
+            nxt()
+        elif a in ('-M', '-MM', '-MD', '-MMD', '-MP', '-MG'):
+            o.dep_flags.append(a)
+        elif a in ('-MF', '-MT', '-MQ'):
+            o.dep_flags += [a, nxt()]
+        elif a.startswith('-MF') or a.startswith('-MT') or a.startswith('-MQ'):
+            o.dep_flags.append(a)
+        elif a.startswith('-'):
+            o.host_flags.append(a)   # forward unknown options (-W*, -f*, -m*, -pthread, ...)
+        else:
+            o.inputs.append(a)
+        i += 1
+    return o
+
+
+def set_arch(o, value):
+    """-arch=sm_70 / compute_75 / arch=compute_80,code=sm_80 -> __CUDA_ARCH__ like nvcc."""
+    nums = re.findall(r'(?:sm|compute)_(\d+)', value)
+    if nums and o.cuda_arch != 'none':
+        o.cuda_arch = str(int(nums[0]) * 10)
+    if nums:
+        o.ptx_arch = int(nums[0])
+
+
+def split_list(s):
+    out = []
+    for part in s.split(','):
+        part = part.strip()
+        if part:
+            out += shlex.split(part)
+    return out
+
+
+def log_cmd(o, cmd):
+    if o.verbose:
+        sys.stderr.write('#$ ' + ' '.join(shlex.quote(c) for c in cmd) + '\n')
+
+
+def run(o, cmd, capture=False, check=True):
+    log_cmd(o, cmd)
+    if capture:
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8', errors='replace')
+    else:
+        r = subprocess.run(cmd)
+    if check and r.returncode != 0:
+        if capture:
+            sys.stderr.write(r.stderr)
+        sys.exit(r.returncode)
+    return r
+
+
+def host_compiler(o):
+    """Return the host C++ compiler command as a list."""
+    if o.target:
+        if o.ccbin and 'clang' in os.path.basename(o.ccbin):
+            return [o.ccbin, '--target=' + o.target]
+        cand = o.ccbin or os.environ.get('PK_CXX') or (o.target + '-g++')
+        if shutil.which(cand):
+            return [cand]
+        if shutil.which('clang++'):
+            return ['clang++', '--target=' + o.target]
+        die('no C++ compiler for target %s (install %s-g++ or clang)' % (o.target, o.target))
+    for cand in (o.ccbin, os.environ.get('PK_CXX'), os.environ.get('CXX'), 'g++', 'clang++', 'c++'):
+        if cand and shutil.which(cand.split()[0]):
+            return shlex.split(cand)
+    die('no host C++ compiler found (install g++ or clang++)')
+
+
+def c_compiler(cxx):
+    name = cxx[0]
+    for a, b in (('clang++', 'clang'), ('g++', 'gcc'), ('c++', 'cc')):
+        if name.endswith(a):
+            cand = name[:-len(a)] + b
+            if shutil.which(cand):
+                return [cand] + cxx[1:]
+    return cxx + ['-x', 'c']
+
+
+def triple_of(cxx):
+    r = subprocess.run(cxx + ['-dumpmachine'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                       encoding='utf-8', errors='replace')
+    t = r.stdout.strip()
+    return t or 'unknown'
+
+
+def std_flag(o):
+    s = o.std or 'c++17'
+    m = re.match(r'(?:c|gnu)\+\+(\d+)', s)
+    if m and m.group(1) in ('98', '03', '0x', '11', '1y', '14'):
+        if o.verbose:
+            sys.stderr.write('pkcc: note: PolyKernel needs C++17; using -std=c++17 instead of %s\n' % s)
+        return '-std=c++17'
+    return '-std=' + s
+
+
+def ensure_runtime(o, cxx):
+    """Build (once per compiler/target) and return the directory holding libpolykernel.a."""
+    triple = triple_of(cxx)
+    srcs = sorted(os.path.join(PK_HOME, 'runtime', f) for f in os.listdir(os.path.join(PK_HOME, 'runtime'))
+                  if f.endswith('.cpp'))
+    hdrs = [os.path.join(PK_HOME, 'runtime', 'pk_internal.h')] + [
+        os.path.join(PK_HOME, 'include', 'polykernel', f) for f in os.listdir(os.path.join(PK_HOME, 'include', 'polykernel'))]
+    h = hashlib.sha256()
+    for f in srcs + sorted(hdrs):
+        with open(f, 'rb') as fh:
+            h.update(fh.read())
+    h.update(' '.join(cxx).encode())
+    stamp = h.hexdigest()[:16]
+    candidates = [os.path.join(PK_HOME, 'lib', triple),
+                  os.path.join(os.path.expanduser('~'), '.cache', 'polykernel', 'lib', triple + '-' + stamp[:8])]
+    for libdir in candidates:
+        try:
+            os.makedirs(libdir, exist_ok=True)
+            if not os.access(libdir, os.W_OK):
+                continue
+        except OSError:
+            continue
+        lib = os.path.join(libdir, 'libpolykernel.a')
+        stamp_file = os.path.join(libdir, 'stamp')
+        lock_path = os.path.join(libdir, '.lock')
+        lockf = open(lock_path, 'w', encoding='utf-8')
+        try:
+            try:
+                import fcntl
+                fcntl.flock(lockf, fcntl.LOCK_EX)
+            except ImportError:
+                pass
+            if os.path.exists(lib) and os.path.exists(stamp_file) and read_text(stamp_file).strip() == stamp:
+                return libdir
+            if o.verbose:
+                sys.stderr.write('pkcc: building the PolyKernel runtime for %s\n' % triple)
+            objs = []
+            flags = ['-O2', '-std=c++17', '-fPIC', '-U_FORTIFY_SOURCE', '-I' + os.path.join(PK_HOME, 'include'),
+                     '-I' + os.path.join(PK_HOME, 'third_party', 'khronos'), '-I' + os.path.join(PK_HOME, 'runtime')]
+            if re.match(r'(x86_64|i\d86|amd64)', triple):
+                flags.append('-fcf-protection=none')   # fibers switch stacks with setjmp/longjmp
+            if 'mingw' in triple or 'windows' in triple:
+                flags.remove('-fPIC')
+            tmp = tempfile.mkdtemp(prefix='pkrt-')
+            for s in srcs:
+                obj = os.path.join(tmp, os.path.basename(s)[:-4] + '.o')
+                run(o, cxx + flags + ['-c', s, '-o', obj])
+                objs.append(obj)
+            ar = None
+            for cand in ([cxx[0][:-3] + 'ar'] if cxx[0].endswith('g++') else []) + \
+                    ([o.target + '-ar'] if o.target else []) + ['llvm-ar', 'ar']:
+                if cand and shutil.which(cand):
+                    ar = cand
+                    break
+            if not ar:
+                die('no archiver (ar) found')
+            if os.path.exists(lib):
+                os.unlink(lib)
+            run(o, [ar, 'rcs', lib] + objs)
+            shutil.rmtree(tmp, ignore_errors=True)
+            with open(stamp_file, 'w', encoding='utf-8') as f:
+                f.write(stamp + '\n')
+            return libdir
+        finally:
+            lockf.close()
+    die('cannot find a writable directory for the runtime library')
+
+
+def device_preprocess(o, cxx, src, tmpdir, arch_override=None):
+    """Preprocess for the device pass: user code only, with stubbed system headers."""
+    stubs = os.path.join(tmpdir, 'autostubs')
+    os.makedirs(stubs, exist_ok=True)
+    for hname in COMMON_HEADERS:
+        p = os.path.join(stubs, hname)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        if not os.path.exists(p):
+            open(p, 'w', encoding='utf-8').close()
+    out = os.path.join(tmpdir, 'device%s.ii' % (arch_override or ''))
+    base = [cxx[0], '-E', '-x', 'c++', '-std=c++17', '-nostdinc',
+            '-I' + os.path.join(PK_HOME, 'tools', 'device_stubs')]
+    arch = arch_override or (o.cuda_arch if o.cuda_arch != 'none' else '800')
+    defs = ['-D__CUDACC__=1', '-D__CUDA_ARCH__=' + arch, '-D__POLYKERNEL__=1', '-DPK_DEVICE_PASS=1',
+            '-DCUDART_VERSION=12000', '-DCUDA_VERSION=12000', '-D__CUDACC_VER_MAJOR__=12',
+            '-D__CUDACC_VER_MINOR__=0']
+    cmd = base + defs + o.pp_flags + ['-idirafter', stubs, '-include', 'cuda_runtime.h', src, '-o', out]
+    for _ in range(200):
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8', errors='replace')
+        if r.returncode == 0:
+            return read_text(out)
+        m = re.search(r"fatal error: ([^:\n]+): No such file or directory", r.stderr)
+        if not m:
+            if o.verbose:
+                sys.stderr.write('pkcc: device pass preprocessing failed:\n' + r.stderr)
+            return None
+        missing = m.group(1).strip()
+        p = os.path.join(stubs, missing)
+        if os.path.exists(p) or '..' in missing or os.path.isabs(missing):
+            return None
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        open(p, 'w', encoding='utf-8').close()
+    return None
+
+
+def compile_ptx(o, cxx, src, tmpdir, dev, label):
+    """PolyKernel's own CUDA -> PTX compiler (NVIDIA GPUs through the driver API)."""
+    target = o.ptx_arch or 60
+    try:
+        from pk_ptx import generate_ptx
+        dsrc = device_preprocess(o, cxx, src, tmpdir, str(target * 10))
+        if dsrc is None:
+            dev['ptx_reason'] = 'device-pass preprocessing failed'
+            return
+        logger = (lambda m: sys.stderr.write('pkcc: %s: %s\n' % (label, m))) if o.verbose else None
+        res = generate_ptx(dsrc, target, logger)
+    except Exception as e:     # never let the PTX compiler break a CPU build
+        if o.verbose:
+            import traceback
+            traceback.print_exc()
+        dev['ptx_reason'] = 'PTX compiler error: %s' % e
+        return
+    dev['ptx_ok'] = res['ptx_ok']
+    dev['ptx_src'] = res['ptx_src'] if res['ptx_ok'] else None
+    dev['ptx_kernels'] = res['kernels'] if res['ptx_ok'] else []
+    dev['ptx_symbols'] = res.get('symbols', [])
+    dev['ptx_reason'] = res['reason'] or ''
+    if o.verbose:
+        sys.stderr.write('pkcc: %s: PTX kernels (sm_%d): %s\n' % (label, res.get('target') or target,
+                                                                  ', '.join(res['kernels']) or '(none)'))
+        for name, why in res['skipped']:
+            sys.stderr.write('pkcc: %s: no PTX for %s: %s\n' % (label, name, why))
+        if res['reason']:
+            sys.stderr.write('pkcc: %s: PTX note: %s\n' % (label, res['reason']))
+
+
+def compile_cu(o, cxx, src, obj, tmpdir):
+    label = os.path.basename(src)
+    std = std_flag(o)
+    host_ii = os.path.join(tmpdir, 'host.ii')
+    arch_def = [] if o.cuda_arch == 'none' else ['-D__CUDA_ARCH__=' + o.cuda_arch]
+    pp = cxx + ['-E', '-x', 'c++', std, '-DPK_TRANSLATING=1', '-D__CUDACC__=1', '-D__POLYKERNEL__=1'] + arch_def + [
+                '-D__CUDACC_VER_MAJOR__=12', '-D__CUDACC_VER_MINOR__=0', '-D__CUDACC_VER_BUILD__=0',
+                '-I' + os.path.join(PK_HOME, 'include')] + o.pp_flags + \
+        [f for f in o.host_flags if f.startswith(('-m', '-f', '-pthread', '-D', '-U', '-std'))] + \
+        ['-include', 'cuda_runtime.h', src, '-o', host_ii]
+    if o.dep_flags:
+        pp += o.dep_flags
+        if not any(f.startswith('-MT') or f.startswith('-MQ') for f in o.dep_flags):
+            pp += ['-MT', obj]
+        if '-MD' in o.dep_flags or '-MMD' in o.dep_flags:
+            if not any(f.startswith('-MF') for f in o.dep_flags):
+                pp += ['-MF', os.path.splitext(obj)[0] + '.d']
+    run(o, pp)
+    host_src = read_text(host_ii)
+
+    # device pass
+    dev_src = device_preprocess(o, cxx, src, tmpdir)
+    if dev_src is None:
+        needs = any(t[0] == 'id' and t[1] in SYNC_IDS for t in tokenize(host_src) if t[0] == 'id')
+        dev = {'needs_fibers': True, 'cl_ok': False, 'reason': 'device-pass preprocessing failed'}
+    elif o.backend == 'cpu':
+        needs = any(t[0] == 'id' and t[1] in SYNC_IDS for t in tokenize(dev_src))
+        dev = {'needs_fibers': needs, 'cl_ok': False, 'reason': 'built with --pk-backend=cpu'}
+    else:
+        logger = (lambda m: sys.stderr.write('pkcc: %s: %s\n' % (label, m))) if o.verbose else None
+        try:
+            dev = generate(dev_src, logger)
+        except Exception as e:   # never let the GPU translation break a CPU build
+            if o.verbose:
+                import traceback
+                traceback.print_exc()
+            needs = any(t[0] == 'id' and t[1] in SYNC_IDS for t in tokenize(dev_src))
+            dev = {'needs_fibers': needs, 'cl_ok': False, 'reason': 'device translation error: %s' % e}
+        if o.verbose:
+            if dev.get('cl_src'):
+                sys.stderr.write('pkcc: %s: OpenCL kernels: %s\n' % (
+                    label, ', '.join(k[0] for k in dev.get('kernels', [])) or '(none)'))
+            for kind, name, err in dev.get('skipped', []):
+                sys.stderr.write('pkcc: %s: CPU-only %s %s: %s\n' % (label, kind, name, err))
+            if dev.get('reason'):
+                sys.stderr.write('pkcc: %s: note: %s\n' % (label, dev['reason']))
+            if dev.get('cl12'):
+                sys.stderr.write('pkcc: %s: OpenCL C 1.2 devices: %s\n' % (label, dev['cl12']))
+            sys.stderr.write('pkcc: %s: barrier support: %s\n' % (label, 'fibers' if dev['needs_fibers'] else 'loop'))
+    if dev_src is not None and o.backend != 'cpu' and o.ptx:
+        compile_ptx(o, cxx, src, tmpdir, dev, label)
+    try:
+        text, info = translate_host(host_src, dev, label)
+    except TranslateError as e:
+        die('%s: %s' % (src, e))
+    pk_ii = os.path.join(tmpdir, 'host.pk.ii')
+    with open(pk_ii, 'w', encoding='utf-8') as f:
+        f.write(text)
+    if o.keep:
+        keepbase = os.path.splitext(obj)[0]
+        shutil.copy(pk_ii, keepbase + '.pk.ii')
+        if dev.get('cl_src'):
+            with open(keepbase + '.cl', 'w', encoding='utf-8') as f:
+                f.write(dev['cl_src'])
+        if dev.get('ptx_src'):
+            with open(keepbase + '.ptx', 'w', encoding='utf-8') as f:
+                f.write(dev['ptx_src'])
+    if o.preprocess_only:
+        sys.stdout.write(text)
+        return
+    cmd = cxx + ['-c', '-x', 'c++-cpp-output', std, o.opt or '-O2', '-fno-strict-aliasing', '-pthread'] + \
+        o.host_flags + [pk_ii, '-o', obj]
+    run(o, cmd)
+
+
+def main(argv):
+    o = parse_args(argv)
+    if not o.inputs:
+        die('no input files')
+    cxx = host_compiler(o)
+    objs = []
+    temps = []
+    sources = [f for f in o.inputs if (o.xlang in ('cu', 'cuda') and not f.endswith(OBJ_EXT))
+               or f.endswith(CU_EXT + CXX_EXT + C_EXT)]
+    if o.compile_only and o.out and len(sources) > 1:
+        die('cannot specify -o with -c and multiple source files')
+    for f in o.inputs:
+        if not os.path.exists(f):
+            die('%s: no such file' % f)
+        is_cu = f.endswith(CU_EXT) or (o.xlang in ('cu', 'cuda') and not f.endswith(OBJ_EXT))
+        if f.endswith(OBJ_EXT) and not is_cu:
+            objs.append(f)
+            continue
+        if o.compile_only or o.preprocess_only:
+            obj = o.out or os.path.splitext(os.path.basename(f))[0] + '.o'
+        else:
+            fd, obj = tempfile.mkstemp(suffix='.o', prefix='pk-')
+            os.close(fd)
+            temps.append(obj)
+        tmpdir = tempfile.mkdtemp(prefix='pkcc-')
+        try:
+            if is_cu:
+                compile_cu(o, cxx, f, obj, tmpdir)
+            elif f.endswith(C_EXT):
+                run(o, c_compiler(cxx) + ['-c', o.opt or '-O2'] + o.pp_flags + o.host_flags + o.dep_flags +
+                    ['-I' + os.path.join(PK_HOME, 'include'), f, '-o', obj])
+            else:
+                run(o, cxx + ['-c', std_flag(o), o.opt or '-O2', '-pthread'] + o.pp_flags + o.host_flags +
+                    o.dep_flags + ['-I' + os.path.join(PK_HOME, 'include'), f, '-o', obj])
+        finally:
+            if not o.keep:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+        objs.append(obj)
+    if o.compile_only or o.preprocess_only:
+        return 0
+    libdir = ensure_runtime(o, cxx)
+    triple = triple_of(cxx)
+    out = o.out or ('a.exe' if 'mingw' in triple else 'a.out')
+    sys_libs = ['-pthread']
+    if 'mingw' in triple or 'windows' in triple:
+        sys_libs = ['-static', '-pthread']
+    elif 'apple' not in triple and 'darwin' not in triple:
+        sys_libs.append('-ldl')
+        r = subprocess.run(cxx + ['-print-file-name=libatomic.so'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           encoding='utf-8', errors='replace')
+        r2 = subprocess.run(cxx + ['-print-file-name=libatomic.a'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            encoding='utf-8', errors='replace')
+        if os.path.isabs(r.stdout.strip()) or os.path.isabs(r2.stdout.strip()):
+            sys_libs.append('-latomic')
+    cmd = cxx + objs + ['-o', out] + o.host_flags + o.link_flags + ['-L' + libdir, '-lpolykernel'] + \
+        o.lib_flags + sys_libs
+    try:
+        run(o, cmd)
+    finally:
+        for t in temps:
+            if os.path.exists(t):
+                os.unlink(t)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

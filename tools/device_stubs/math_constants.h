@@ -1,0 +1,26 @@
+// PolyKernel: CUDA math constants (values are standard mathematical constants)
+#ifndef POLYKERNEL_MATH_CONSTANTS_H
+#define POLYKERNEL_MATH_CONSTANTS_H
+#define CUDART_INF_F (__builtin_huge_valf())
+#define CUDART_NAN_F (__builtin_nanf(""))
+#define CUDART_INF (__builtin_huge_val())
+#define CUDART_NAN (__builtin_nan(""))
+#define CUDART_PI_F 3.141592654f
+#define CUDART_PIO2_F 1.570796327f
+#define CUDART_2_OVER_PI_F 0.636619772f
+#define CUDART_SQRT_HALF_F 0.707106781f
+#define CUDART_SQRT_2_F 1.414213562f
+#define CUDART_LN2_F 0.693147181f
+#define CUDART_L2E_F 1.442695041f
+#define CUDART_MAX_NORMAL_F 3.40282347e+38f
+#define CUDART_MIN_DENORM_F 1.40129846e-45f
+#define CUDART_ONE_F 1.0f
+#define CUDART_ZERO_F 0.0f
+#define CUDART_PI 3.1415926535897931e+0
+#define CUDART_PIO2 1.5707963267948966e+0
+#define CUDART_2PI 6.2831853071795862e+0
+#define CUDART_SQRT_2 1.4142135623730951e+0
+#define CUDART_SQRT_HALF 7.0710678118654757e-1
+#define CUDART_LN2 6.9314718055994529e-1
+#define CUDART_L2E 1.4426950408889634e+0
+#endif
